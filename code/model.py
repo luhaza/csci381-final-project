@@ -1,52 +1,163 @@
 import torch
+import random
 import torch_geometric
 
+from tqdm import tqdm
+import scipy.sparse as sp # was having very annoying issues with torch_sparse
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
-from torch.nn import Embedding, Linear, init
-from representations import build_interaction_matrix_from_edges
+from torch_geometric.nn.models.lightgcn import BPRLoss
+from torch.nn import Embedding, init, functional
+from torch_geometric.utils import structured_negative_sampling
+from representations import extract_interaction_matrix
 
+# training constants
+ITERATIONS = 10000
+BATCH_SIZE = 1024
+LR = 1e-3
+ITERS_PER_EVAL = 100
+ITERS_PER_LR_DECAY = 200
+K = 20
+LAMBDA = 1e-6
+
+# extend MessagePassing from PyG for Message/Aggregation
 class LightGCN(MessagePassing):
 
-    def __init__(self, num_src, num_dest, dropout_rate=0.1, embedding_dim=64, layers=3):
+    def __init__(self, num_users, num_items, embedding_dim=64, K=3):
         super().__init__()
-        self.num_src = num_src
-        self.num_dest = num_dest
-        self.dropout_rate = dropout_rate
+        self.num_users = num_users
+        self.num_items = num_items
         self.embedding_dim = embedding_dim
-        self.layers = layers
+        self.K = K
 
-        self.src_emb = Embedding(num_embeddings=self.num_src, 
+        # embed initial users & items
+        self.users_emb = Embedding(num_embeddings=self.num_users, 
                                embedding_dim=self.embedding_dim)
-        self.dest_emb = Embedding(num_embeddings=self.num_dest, 
+        self.items_emb = Embedding(num_embeddings=self.num_items, 
                                embedding_dim=self.embedding_dim)
         
-        init.normal_(self.src_emb.weight, std=0.1)
-        init.normal_(self.dest_emb.weight, std=0.1)
+        # normal initialization
+        init.normal_(self.users_emb.weight, std=0.1)
+        init.normal_(self.items_emb.weight, std=0.1)
+    
+    # edge index : adjacency matrix sparse tensor 
+    def forward(self, edge_index):
+        # edge_index = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(self.num_users+self.num_items, self.num_users+self.num_items))
+        # print(edge_index)
+        normalized_edge_index = gcn_norm(edge_index=edge_index, 
+                                   add_self_loops=False)
+        
+        emb0 = torch.cat([self.users_emb.weight, self.items_emb.weight])
+        embs = [emb0]
 
-        self.out = Linear(embedding_dim + embedding_dim, 1)
+        # for each layer, propagate
+        for _ in range(self.K):
+            # emb0 is the only trainable embedding
+            embk = self.propagate(normalized_edge_index, x=emb0)
+            embs.append[embk]
 
-    def forward(self, edges, values):
-        # edges : edge indices (2xN matrix)
-        # values : value for each link (1xN matrix)
+        embs = torch.stack(embs, dim=1)
 
-        # compute symmetrical normalization A~
-        norm = gcn_norm(edges, add_self_loops=False)
+        # mean at embedding k
+        mean_at_k = torch.mean(embs, dim=1)
 
-        e_0 = torch.cat([self.src_emb.weight, self.dest_emb.weight])
-        e = [e_0]
-        e_k = e_0
+        # split back into users and items at k
+        u_k, i_k = torch.split(mean_at_k, [self.num_users, self.num_items])
 
-        for i in range(self.layers):
-            e_k = self.propagate(edge_index=norm[0], x=e_k, norm=norm[1])
-            e.append(e_k)
+        # must return all this for BPR loss calculation
+        return u_k, self.users_emb.weight, i_k, self.items_emb.weight
 
-        e = torch.stack(e, dim=1)
-        final = torch.mean(e, dim=1)
-        user_emb, item_emb = torch.split(final, [self.num_src, self.num_dest])
-        indices = 
+    def message(self, x):
+        return x
+    
+    def message_and_aggregate(self, adj_t, x):
+        return torch.sparse.mm(adj_t, x)
+    
 
-        raise NotImplementedError("TODO")
+    # def forward(self, edges, values):
+    #     # edges : edge indices (2xN matrix)
+    #     # values : value for each link (1xN matrix)
 
-    def message(self, x, norm):
-        return norm.view(-1, 1) * x
+    #     # compute symmetrical normalization A~
+    #     norm = gcn_norm(edges, add_self_loops=False)
+
+    #     e_0 = torch.cat([self.src_emb.weight, self.dest_emb.weight])
+    #     e = [e_0]
+    #     print(e_0, e_0.size())
+
+    #     for _ in range(self.layers):
+    #         e_k = self.propagate(edge_index=norm[0], x=e_0, norm=norm[1])
+    #         e.append(e_k)
+
+    #     e = torch.stack(e, dim=1)
+    #     final = torch.mean(e, dim=1)
+    #     user_emb, item_emb = torch.split(final, [self.num_users, self.num_items])
+    #     indices, _ = extract_interaction_matrix(edges, values, self.num_users, self.num_items)
+    #     src, dest = indices[0], indices[1]
+    #     user_embs = user_emb[src]
+    #     item_embs = item_emb[dest]
+
+    #     out = torch.cat([user_embs, item_embs], dim=1)
+
+    #     return self.out(out)
+    
+def bpr_loss(u_k, u_0, pos_i_k, pos_i_0, neg_i_k, neg_i_0, l):
+    # BPR (Bayesian Personalized Ranking) loss function, as used in the paper
+
+    regularized_loss = (u_0.norm(2).pow(2)
+                        + pos_i_0.norm(2).pow(2)
+                        + neg_i_0.norm(2).pow(2)) + l
+    
+    pos = torch.sum(torch.mul(u_k, pos_i_k), dim=1)
+    neg = torch.sum(torch.mul(u_k, neg_i_k), dim=1)
+
+    return -torch.mean(functional.softplus(pos-neg)) + regularized_loss
+
+def pos_neg_minibatch(size, edges):
+    # Minibatch for getting pos/neg samples and training, as used in the paper
+
+    sample = torch.stack(structured_negative_sampling(edges), dim=0)
+    all_index = list(range(sample[0].shape[0]))
+    selected_index = random.choices(all_index, k=size)
+    minibatch = edges[:, selected_index]
+
+    return minibatch[0], minibatch[1], minibatch[2]
+
+def to_device(things, device):
+    for thing in things:
+        thing.to(device)
+
+def train_model(model, device, optimizer, scheduler,
+                train_set, train_set_sparse):
+    # Training loop
+
+    training_loss = []
+
+    for iter in tqdm(range(ITERATIONS)):
+        u_k, u_0, i_k, i_0 = model.forward(train_set_sparse)
+
+        u, pos, neg = pos_neg_minibatch(BATCH_SIZE, train_set)
+        things = [u, pos, neg]
+        to_device(things, device)
+
+        u_k = u_k[u]
+        u_0 = u_0[u]
+
+        pos_k = i_k[pos]
+        pos_0 = i_0[pos]
+
+        neg_k = i_k[neg]
+        neg_0 = i_0[neg]
+
+        loss = bpr_loss(u_k, u_0, pos_k, pos_0, neg_k, neg_0, LAMBDA)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if iter % ITERS_PER_EVAL == 0:
+            training_loss.append(loss.item())
+            print(f"Training... loss at iteration {iter}/{ITERATIONS} = {round(loss.item(),5)}.")
+
+        if iter % ITERS_PER_LR_DECAY == 0 and iter != 0:
+            scheduler.step()

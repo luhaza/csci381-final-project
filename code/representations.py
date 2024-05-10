@@ -51,8 +51,14 @@ def convert_to_dense_adj_matrix(A, r, c, V, use_value=True):
 
     return torch.cat((left, right), dim=1)
 
-def extract_interaction_matrix(A, r, c, V,):
+def extract_interaction_matrix(edges, values, num_users, num_items):
     # extract the original interaction matrix from the adjacency matrix (edge index)
 
+    sparse = torch.sparse_coo_tensor(edges, values, (num_items+num_users, num_users+num_items))
+    adj_matrix = sparse.to_dense()
 
-    return A[:r, -c:] 
+    interact_matrix = adj_matrix[:num_users, num_users:]
+
+    sparse_interact_matrix = interact_matrix.to_sparse_coo()
+
+    return sparse_interact_matrix.indices(), sparse_interact_matrix.values()
