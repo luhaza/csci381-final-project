@@ -10,6 +10,7 @@ from torch_geometric.nn.models.lightgcn import BPRLoss
 from torch.nn import Embedding, init, functional
 from torch_geometric.utils import structured_negative_sampling
 from representations import extract_interaction_matrix
+from torch_sparse import matmul
 
 # training constants
 ITERATIONS = 10000
@@ -42,19 +43,18 @@ class LightGCN(MessagePassing):
     
     # edge index : adjacency matrix sparse tensor 
     def forward(self, edge_index):
-        # edge_index = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(self.num_users+self.num_items, self.num_users+self.num_items))
-        # print(edge_index)
         normalized_edge_index = gcn_norm(edge_index=edge_index, 
                                    add_self_loops=False)
         
         emb0 = torch.cat([self.users_emb.weight, self.items_emb.weight])
-        embs = [emb0]
+        embs = []
+        embs.append(emb0)
 
         # for each layer, propagate
         for _ in range(self.K):
             # emb0 is the only trainable embedding
             embk = self.propagate(normalized_edge_index, x=emb0)
-            embs.append[embk]
+            embs.append(embk)
 
         embs = torch.stack(embs, dim=1)
 
@@ -71,35 +71,8 @@ class LightGCN(MessagePassing):
         return x
     
     def message_and_aggregate(self, adj_t, x):
-        return torch.sparse.mm(adj_t, x)
-    
+        return matmul(adj_t, x)
 
-    # def forward(self, edges, values):
-    #     # edges : edge indices (2xN matrix)
-    #     # values : value for each link (1xN matrix)
-
-    #     # compute symmetrical normalization A~
-    #     norm = gcn_norm(edges, add_self_loops=False)
-
-    #     e_0 = torch.cat([self.src_emb.weight, self.dest_emb.weight])
-    #     e = [e_0]
-    #     print(e_0, e_0.size())
-
-    #     for _ in range(self.layers):
-    #         e_k = self.propagate(edge_index=norm[0], x=e_0, norm=norm[1])
-    #         e.append(e_k)
-
-    #     e = torch.stack(e, dim=1)
-    #     final = torch.mean(e, dim=1)
-    #     user_emb, item_emb = torch.split(final, [self.num_users, self.num_items])
-    #     indices, _ = extract_interaction_matrix(edges, values, self.num_users, self.num_items)
-    #     src, dest = indices[0], indices[1]
-    #     user_embs = user_emb[src]
-    #     item_embs = item_emb[dest]
-
-    #     out = torch.cat([user_embs, item_embs], dim=1)
-
-    #     return self.out(out)
     
 def bpr_loss(u_k, u_0, pos_i_k, pos_i_0, neg_i_k, neg_i_0, l):
     # BPR (Bayesian Personalized Ranking) loss function, as used in the paper
@@ -119,7 +92,7 @@ def pos_neg_minibatch(size, edges):
     sample = torch.stack(structured_negative_sampling(edges), dim=0)
     all_index = list(range(sample[0].shape[0]))
     selected_index = random.choices(all_index, k=size)
-    minibatch = edges[:, selected_index]
+    minibatch = sample[:, selected_index]
 
     return minibatch[0], minibatch[1], minibatch[2]
 
@@ -157,7 +130,6 @@ def train_model(model, device, optimizer, scheduler,
 
         if iter % ITERS_PER_EVAL == 0:
             training_loss.append(loss.item())
-            print(f"Training... loss at iteration {iter}/{ITERATIONS} = {round(loss.item(),5)}.")
 
         if iter % ITERS_PER_LR_DECAY == 0 and iter != 0:
             scheduler.step()
